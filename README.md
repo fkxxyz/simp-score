@@ -81,7 +81,7 @@ texture s:{
 
 三个参数位置可以随意调整和缺省，因为解析的时候，前面带有+就是和弦转位，-就是减法法则，不带就是织体标识，参数之间用逗号隔开。
 
-此外还有一些细节，在示例中说到。
+此外还有一些细节，在示例中说到，详见 [summer.txt](https://github.com/fkxxyz/simp-score/blob/master/summer.txt)。
 
 ## 程序诞生
 
