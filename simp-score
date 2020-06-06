@@ -1,0 +1,1023 @@
+#!/usr/bin/env python
+#-*- encoding:utf-8 -*-
+
+import argparse
+import os
+import sys
+import re
+from fractions import Fraction
+
+import mingus.core.meter as meter
+import mingus.core.notes as notes
+from mingus.containers import Note
+from mingus.containers import NoteContainer
+from mingus.containers import Bar
+from mingus.containers import Track
+from mingus.containers import Composition
+
+
+chord_dict = {
+    '':       (0,4,7),
+    '7':      (0,4,7,10),
+    '9':      (0,4,7,10,14),
+    'aug':    (0,4,8),
+    '+':      (0,4,8),
+    'dim':    (0,3,6),
+    '-':      (0,3,6),
+    '6':      (0,4,7,9),
+    'maj7':   (0,4,7,11),
+    'M7':     (0,4,7,11),
+    'maj9':   (0,4,7,11,14),
+    'M9':     (0,4,7,11,14),
+    '11':     (0,4,7,10,14,17),
+    '13':     (0,4,7,10,14,17,19),
+    '7-5':    (0,4,6,10),
+    '7dim5':  (0,4,6,10),
+    'add9':   (0,2,4,7),
+    'sus2':   (0,2,7),
+    'sus4':   (0,5,7),
+    '7sus4':  (0,5,7,10),
+    'm':      (0,3,7),
+    'm7':     (0,3,7,10),
+    'm9':     (0,3,7,10,14),
+    'm6':     (0,3,7,9),
+    'm7-5':   (0,3,6,10),
+    'm7dim5': (0,3,6,10),
+    'madd9':  (0,2,3,7),
+}
+
+
+class numberedMusicalNotationParser():
+    
+    def __init__(self):
+        # 默认 bpm=120, 4/4拍, 调性为C
+        self.bpm = 120
+        self.beat = (4,4)
+        self.tonality = 'C'
+        self.chord_transposition = 'C'
+        
+        # 是否允许中途设置 beat
+        # 该变量是为了防止同一小节的不同声部的节拍不同
+        # 必须在 - 后面紧接着设置 beat
+        self.beat_settable = True
+        
+        # 小节列表
+        #   每个元素为所有声部 Bar ，是列表
+        self.bar_lists = []
+        
+        # 当前行首对应小节索引
+        self.line_start_index = 0
+        
+        # 和弦织体
+        #   格式为：
+        #       {织体名:织体内容,织体名:织体内容,...}
+        #       织体内容格式为：
+        #           (默认织体,织体字典)
+        #           织体字典的格式为：
+        #               {标识符:织体,标识符:织体,...}
+        #               织体为字符串
+        self.texture = dict()
+        
+        # 当前正在定义的织体名称和内容
+        self.current_texture_name = None
+        self.current_texture = None
+
+
+
+        # 基本简谱的映射规则
+        self.base_mapping_rule = {
+            '0': None,
+            '1': 0,
+            '2': 2,
+            '3': 4,
+            '4': 5,
+            '5': 7,
+            '6': 9,
+            '7': 11,
+        }
+
+        # 字典，用于替换织体的内容字符
+        self.texture_mapping_rule = {'0': None}
+        value = 0
+        i = ord('1')
+        while i <= ord('9'):
+            self.texture_mapping_rule[chr(i)] = value
+            value += 1
+            i += 1
+        i = ord('a')
+        while i <= ord('z'):
+            self.texture_mapping_rule[chr(i)] = value
+            value += 1
+            i += 1
+        i = ord('A')
+        while i <= ord('Z'):
+            self.texture_mapping_rule[chr(i)] = value
+            value += 1
+            i += 1
+        self.texture_mapping_rule['?'] = self.texture_mapping_rule['b']
+        self.texture_mapping_rule['!'] = 0
+        del self.texture_mapping_rule['b']
+
+        # 所有和弦的映射
+        self.chord_mapping = dict()
+        for key in chord_dict:
+            mapping = []
+
+            octaves = chord_dict[key][-1] // 12 * 12 + 12
+            chord_array = list(chord_dict[key])
+            while len(mapping) < len(self.texture_mapping_rule):
+                mapping.extend(chord_array)
+
+                # 每个值都加上 octaves
+                for i in range(len(chord_array)):
+                    chord_array[i] += octaves
+
+            self.chord_mapping[key] = mapping
+
+        # 如果需要了解此成员变量的功能，打印它就明白了
+        #   print(self.chord_mapping['m'])
+
+    # 定义解析音符的函数（用于递归处理带括号）
+    def parseNoteStr(self, text, mapping_rule, mapping = tuple(range(12)), mapping_offset = 0):
+        """
+            text:
+                要解析的字符串
+            mapping_rule:
+                映射字典，将数字或字母替换成此音值，注意 b 是例外，它是降音符号不可映射
+                例如：
+                    {'1': 69,
+                     '2': 71}
+                     表示 1 代表音值 69 ， 2 代表音值 71
+                     注意音值是 None 表示休止符
+            mapping:
+                映射字典的映射，将 mapping_rule 的结果会再次通过此参数映射
+                加上该参数是为了处理和弦，和弦的每个音的音程和音阶不同，把和弦和音阶设置不同的 mapping，能加快效率，感叹号不受此值影响
+            mapping_offset:
+                映射后进行偏移的偏移量，处理后会加上该值，感叹号不受此值影响
+            返回: 成功则返回 (长度,列表,连音列表)
+                    长度：
+                        从开始到结尾的字符数，遇到的 ')' 也算结尾
+                    列表：
+                        每个元素格式 [时值,音值]
+                        时值: 几分音符
+                        音值: 数字 或 None 或排好序的数字列表
+                                None 表示休止符
+                                数字列表表示这几个键同时按下
+                  失败则返回 (错误位置,提示字符串)
+        """
+        assert 'b' not in mapping_rule
+
+        i = 0
+        r_list = []  # 音符列表，每个音符格式为 [时值,数值]
+        last_rid = -1  # 表示上一组音符的开始处，括号为一组。
+        ties_pos = []  # 连音列表，最终会整合延音，将对应音符合并（时值叠加）
+                        #      格式为 [连音的音符索引索, 连音符的字符位置]
+
+        container = None # 同时按键列表，当次值为列表时，进入同时按键的输入状态
+
+        while i < len(text):
+            c = text[i]
+            if c.isspace():
+                pass
+            elif c == 'b':
+                if container is None:
+                    if last_rid < 0:
+                        return (i, '降音符号应该放到音符后。')
+                    for j in range(last_rid, len(r_list)):
+                        if r_list[j][1] is not None:
+                            if type(r_list[j][1]) == int:
+                                r_list[j][1] -= 1
+                            else:
+                                for k in range(len(r_list[j][1])):
+                                    r_list[j][1][k] -= 1
+                else:
+                    if len(container) == 0:
+                        return (i, '降音符号应该放到音符后。')
+                    else:
+                        container[-1] -= 1
+            elif c.isalnum() or c == '?' or c == '!':
+                if c not in mapping_rule:
+                    return (i, '未知的音符 “%s”。' % c)
+                if container is None:
+                    last_rid = len(r_list)
+                if mapping_rule[c] is None:
+                    if container is None:
+                        r_list.append([Fraction(4,1), None])
+                    else:
+                        return (i, '中括号内不允许出现休止符')
+                else:
+                    if c == '!':
+                        note_int = mapping_rule[c]
+                    else:
+                        note_int = mapping[mapping_rule[c]] + mapping_offset
+                    if container is None:
+                        r_list.append([Fraction(4,1), note_int])
+                    else:
+                        container.append(note_int)
+            elif c == '#':
+                if container is None:
+                    if last_rid < 0:
+                        return (i, '升音符号应该放到音符后。')
+                    for j in range(last_rid, len(r_list)):
+                        if r_list[j][1] is not None:
+                            if type(r_list[j][1]) == int:
+                                r_list[j][1] += 1
+                            else:
+                                for k in range(len(r_list[j][1])):
+                                    r_list[j][1][k] += 1
+                else:
+                    if len(container) == 0:
+                        return (i, '升音符号应该放到音符后。')
+                    else:
+                        container[-1] += 1
+            elif c == '_':
+                if container is not None:
+                    return (i, '中括号里不允许出现分音符号')
+                if last_rid < 0:
+                    return (i, '分音符号应该放到音符后。')
+                for j in range(last_rid, len(r_list)):
+                    r_list[j][0] *= 2
+            elif c == '-':
+                if container is not None:
+                    return (i, '中括号里不允许出现延音符号')
+                if last_rid < 0 or (4 / r_list[last_rid][0]).denominator != 1:
+                    return (i, '延音符号应该放到四分音符后。')
+                for j in range(last_rid, len(r_list)):
+                    r_list[j][0] = 1/((1/r_list[j][0])+Fraction(1,4))
+            elif c == '$':
+                if container is not None:
+                    return (i, '中括号里不允许出现连音符号')
+                if last_rid < 0:
+                    return (i, '连音符号应该放到音符后。')
+                n = len(r_list) - last_rid
+                if n == 1:
+                    return (i, '无法一连音，请把前面要连音的音符放到括号里')
+                for j in range(last_rid, len(r_list)):
+                    r_list[j][0] *= n
+            elif c == '^':  # 连音符号
+                if container is not None:
+                    return (i, '中括号里不允许出现连音符号')
+                ties_pos.append([len(r_list) - 1, i])
+            elif c == '*':
+                if container is not None:
+                    return (i, '中括号里不允许出现附点符号')
+                if last_rid < 0:
+                    return (i, '附点符号应该放到音符后。')
+                for j in range(last_rid, len(r_list)):
+                    r_list[j][0] /= Fraction(3, 2)
+            elif c == '`':
+                if container is None:
+                    if last_rid < 0:
+                        return (i, '高音符号应该放到音符后。')
+                    for j in range(last_rid, len(r_list)):
+                        if r_list[j][1] is not None:
+                            if type(r_list[j][1]) == int:
+                                r_list[j][1] += 12
+                            else:
+                                for k in range(len(r_list[j][1])):
+                                    r_list[j][1][k] += 12
+                else:
+                    if len(container) == 0:
+                        return (i, '高音符号应该放到音符后。')
+                    else:
+                        container[-1] += 12
+            elif c == '.':
+                if container is None:
+                    if last_rid < 0:
+                        return (i, '低音符号应该放到音符后。')
+                    for j in range(last_rid, len(r_list)):
+                        if r_list[j][1] is not None:
+                            if type(r_list[j][1]) == int:
+                                r_list[j][1] -= 12
+                            else:
+                                for k in range(len(r_list[j][1])):
+                                    r_list[j][1][k] -= 12
+                else:
+                    if len(container) == 0:
+                        return (i, '低音符号应该放到音符后。')
+                    else:
+                        container[-1] -= 12
+            elif c == '[':
+                if container is not None:
+                    return (i, '中括号里不允许出现中括号')
+                container = []
+            elif c == ']':
+                container.sort()
+                last_rid = len(r_list)
+                r_list.append([Fraction(4,1), container])
+                container = None
+            elif c == '(':
+                if container is not None:
+                    return (i, '中括号里不允许出现括号')
+
+                # 跳过 '('
+                i += 1
+
+                # 调用本函数，解析括号里面的字符串（实现递归，可以套无穷的括号）
+                r = self.parseNoteStr(text[i:], mapping_rule, mapping, mapping_offset)
+                if type(r[1]) == str:
+                    return (i+r[0], r[1])
+
+                # 整合连音，合并到括号外面
+                for j in range(len(r[2])):
+                    r[2][j][0] += len(r_list)  # 音符位置偏移
+                    r[2][j][1] += i   # 在字符串中的位置偏移
+                ties_pos.extend(r[2])
+
+                # 将括号内的音符作为一组，整体
+                last_rid = len(r_list)
+
+                # 将括号内的音符合并入音符列表
+                r_list.extend(r[1])
+
+                i += r[0]
+                if i >= len(text) or text[i] != ')':
+                    return (i, '缺少 “)”')
+            elif c == ')':
+                if container is not None:
+                    return (i, '中括号里不允许出现括号')
+                return (i, r_list, ties_pos)
+            else:
+                return (i, '格式错误：未知的字符 “%s”。' % c)
+            i += 1
+
+        return (i, r_list, ties_pos)
+
+    def r_list_to_bar(self, r_list, fill_rest = False):
+        # 计算长度（单位为四分音符的个数）
+        def calcBarLength(r_list):
+            f = Fraction(0, 1)
+            for note in r_list:
+                f += Fraction(4, 1) / note[0]
+            return f
+        
+        # 转换成 Bar 格式
+        bar = Bar(self.tonality, self.beat)
+        for note in r_list:
+            if note[1] is None:
+                ret = bar.place_rest(note[0])
+            else:
+                if type(note[1]) == int:
+                    ret = bar.place_notes(Note(note[1]), note[0])
+                else:
+                    ret = bar.place_notes(NoteContainer(map(Note,note[1])), note[0])
+            if not ret:
+                barLen = calcBarLength(r_list)
+                r = barLen - Fraction(self.beat[0] * 4, self.beat[1])
+                return(0, '音符时值之和超出小节的容量 %s 个四分音符。' % str(r))
+        if not bar.is_full():
+            barLen = calcBarLength(r_list)
+            r = Fraction(self.beat[0] * 4, self.beat[1]) - barLen
+            if fill_rest:
+                bar.place_rest(4/r)  # 填充休止符
+                assert bar.is_full()
+            else:
+                return(0, '该小节还剩 %s 个四分音符未填满。' % str(r))
+        return bar
+
+    def parse_bar(self, text):
+        """
+            解析一小节的内容
+            text:
+                要解析的小节
+            返回值：
+                返回 Bar 类型表示解析成功，否则返回二元组 (错误位置,提示字符串)
+        """
+        
+        # 开始解析
+        result = self.parseNoteStr(text, self.base_mapping_rule, tuple(range(12)), int(Note(self.tonality)))
+
+        # 是报错则直接报错返回
+        if type(result[1]) == str:
+            return result
+
+        # 帮助调试，确保字符串被解析完了
+        if result[0] < len(text):
+            return (result[0], '缺少左括号“(”')
+
+        r_list = result[1]
+
+        # 开始连音，合并连音线之间相同的音符
+        ties_pos = result[2]
+        i = len(ties_pos) - 1
+        while i >= 0:
+            pos = ties_pos[i][0]
+            if pos == -1 or pos >= len(r_list)-1:
+                return (ties_pos[i][1], '暂时不支持跨小节连音')
+
+            if r_list[pos][1] == r_list[pos+1][1]:
+                # r_list[pos] 与 r_list[pos+1] 的时值叠加并删除 r_list[pos+1]
+                r_list[pos][0] = 1/(1/r_list[pos][0] + 1/r_list[pos+1][0])
+                del r_list[pos+1]
+            else:
+                return (ties_pos[i][1], '暂时不支持圆滑线（不支持不同音符连音）')
+
+            i -= 1
+        return self.r_list_to_bar(r_list)
+    
+    def parse_texture(self, rule, chord_info, texture_content, num_strip = 0, inversion = 0):
+        """
+            解析织体内容参数
+            rule:
+                定义的织体规则
+            chord_info:
+                和弦信息，是三元组 (根音,重音,和弦的映射)
+            texture_content:
+                要解析的织体内容参数
+            num_strip:
+                减法单位数量
+            inversion:
+                转位数
+            返回: 成功则返回音符列表
+                    音符列表的格式为 [音符,音符,...]
+                        每个音符的格式 [时值,音值]
+                            时值: 几分音符
+                            音值: 数字 或 None
+                                    None 表示休止符
+                  失败则返回 (错误位置,提示字符串)
+        """
+
+        # 根音
+        root_note = chord_info[0]
+
+        # 重音
+        accent = chord_info[1]
+
+        # 和弦类型映射
+        chord_mapping = chord_info[2]
+
+        # 展开后的内容
+        r_chord_str = ''
+
+        # 织体替换规则
+        rule_dict = rule[1]
+
+        # 开始替换
+        offset = 0
+        while offset < len(texture_content):
+            c = texture_content[offset]
+
+            # 跳过空白字符
+            if c.isspace():
+                offset += 1
+                continue
+
+            # 检查错误
+            if c not in rule_dict:
+                return (offset, "织体定义中未定义该标识“%s”" % c)
+
+            r_chord_str += rule_dict[c]
+
+            offset += 1
+
+        # 设置重音的映射
+        self.texture_mapping_rule['!'] = int(Note(self.tonality)) + notes.note_to_int(accent)
+
+        # 开始解析
+        r = self.parseNoteStr(
+            r_chord_str,
+            self.texture_mapping_rule,
+            chord_mapping[inversion:],
+            int(Note(self.tonality)) + notes.note_to_int(root_note))
+        if type(r[1]) == str: # 错误处理
+            return r
+        r_list = r[1]
+
+        # 执行减法
+        if num_strip == 3:
+            print(r_list)
+        if num_strip > 0:
+            if num_strip > len(r_list):
+                num_strip = len(r_list)
+            for i in range(len(r_list)-num_strip,len(r_list)):
+                r_list[i][1] = None
+
+        return r_list
+
+    def parse_chrods_bar(self, text):
+        """
+            解析一小节的和弦内容
+            text:
+                要解析的小节
+            返回值：
+                返回 Bar 类型表示解析成功，否则返回二元组 (错误位置,提示字符串)
+        """
+
+        r_list = []
+
+        offset = 0
+        while offset < len(text):
+            # 跳过空白
+            while text[offset].isspace():
+                offset += 1
+                if offset >= len(text):
+                    break
+            if offset >= len(text):
+                break
+
+            # 匹配织体名称
+            m = re.match('[A-Za-z]\w*', text[offset:])
+            if m is None:
+                return (offset, '织体定义格式不正确，缺少织体名称')
+            texture_name = m.group()
+            if texture_name not in self.texture:
+                return (offset, '织体 %s 为定义' % texture_name)
+            offset += m.end()
+            if offset >= len(text):
+                return (offset, '织体定义格式不正确，缺少括号 “(”')
+
+            # 跳过空白
+            while text[offset].isspace():
+                offset += 1
+                if offset >= len(text):
+                    return (offset, '织体定义格式不正确，缺少括号 “(”')
+
+            # 匹配左括号
+            if text[offset] != '(':
+                return (offset, '织体定义格式不正确，缺少括号 “(”')
+            offset += 1
+
+            # 寻找到右括号
+            end_pos = text[offset:].find(')') + offset
+            if end_pos == -1:
+                return (len(text), '织体定义格式不正确，缺少右括号 “)”')
+
+            # 解析参数，逗号为分隔符
+            arg_list = text[offset:end_pos].split(',')
+
+            # 第一个参数是和弦名
+            chord_name = arg_list[0].strip()
+
+            # 解析和弦名
+            chord_str = chord_name.split('/')
+            accent = None
+            if len(chord_str) == 2:
+                accent = chord_str[1].strip()
+                if not notes.is_valid_note(accent):
+                    return (offset + len(chord_str[0]) + 1, '错误的重音 “%s”' % accent)
+            elif len(chord_str) > 2:
+                return (offset + len(chord_str[0]) + len(chord_str[1]) + 1,
+                    '错误的和弦名称，只能有一个“/”符号')
+            chord_name_main = chord_str[0].strip()
+            chord_name_main_offset = offset + len(chord_str[0]) - len(chord_str[0].lstrip())
+            if len(chord_name_main) == 0:
+                return (chord_name_main_offset, '和弦不允许为空')
+            elif len(chord_name_main) == 1:
+                chord_type_start = 1
+            elif chord_name_main[1] == 'b' or chord_name_main[1] == '#':
+                chord_type_start = 2
+            else:
+                chord_type_start = 1
+            root_note = chord_name_main[:chord_type_start]
+            if not notes.is_valid_note(root_note):
+                return (chord_name_main_offset, '错误的根音 “%s”' % root_note)
+            if accent is None:
+                accent = root_note
+            chord_type = chord_name_main[chord_type_start:].strip()
+            if chord_type not in chord_dict:
+                return (chord_name_main_offset + chord_type_start, '和弦类型未定义 “%s”' % chord_type)
+
+            # 和弦名解析完毕
+            offset += len(arg_list[0])
+
+            # 设置默认的织体内容、减法数目、转位
+            texture_content = self.texture[texture_name][0]
+            num_strip = 0
+            inversion = 0
+
+            # 这是织体内容的位置，当有织体参数会设置该值
+            texture_content_offset = None
+
+            # 解析剩下的参数
+            for arg in arg_list[1:]:
+                offset += 1  # 这是逗号
+
+                arg_l = arg.lstrip()
+                if arg_l[0] == '-':
+                    arg_num = arg_l[1:].strip()
+                    if not arg_num.isdigit():
+                        return (offset + len(arg)-len(arg_l) + 1,
+                            '减法单位数量必须为正整数。')
+                    num_strip = int(arg_num)
+                elif arg_l[0] == '+':
+                    arg_num = arg_l[1:].strip()
+                    if not arg_num.isdigit():
+                        return (offset + len(arg)-len(arg_l) + 1,
+                            '转位数量必须为正整数。')
+                    inversion = int(arg_num)
+                else:  # 说明是转位标识组
+                    if texture_content_offset is None:
+                        texture_content = arg_l
+                        texture_content_offset = offset
+                    else:
+                        return (offset, '多余的参数')
+
+                offset += len(arg)
+
+            # 接下来开始解析织体内容
+            r = self.parse_texture(self.texture[texture_name],
+                                      (root_note, accent, self.chord_mapping[chord_type]),
+                                      texture_content, num_strip, inversion)
+            if len(r) == 2 and type(r[0]) == int:
+
+                # 确保默认织体正确解析，如果此行触发，则需要修改测试解析默认织体的代码
+                assert texture_content_offset is not None
+
+                # 错误处理
+                return (r[0], r[1])
+
+            # 合并
+            r_list.extend(r)
+
+            # 直接将指针设置到右括号后面，准备解析下一个和弦织体
+            offset = end_pos + 1
+
+        return self.r_list_to_bar(r_list, True)
+
+    def parse_line(self, text, is_valid = True):
+        """
+            解析一行的内容
+            text:
+                要解析的行，前后的空格已经去掉
+            is_valid:
+                该行的小节是否有效
+            返回值：
+                None 表示解析成功，否则返回二元组 (错误位置,提示字符串)
+        """
+        # 跳过空行和注释
+        if len(text) == 0:
+            return None
+        if text[0] == '#':
+            return None
+        
+        # 正在定义织体
+        if self.current_texture_name is not None:
+            key = text[0]
+            offset = 1
+
+            if key == '}':
+                # 空白收尾
+                while offset < len(text):
+                    if not text[offset].isspace():
+                        return (offset,
+                            '织体定义格式不正确，多余的字符 “%s”' % text[offset])
+                    offset += 1
+
+                self.texture[self.current_texture_name] = self.current_texture
+                self.current_texture_name = None
+                self.current_texture = None
+                return None
+
+            
+            # 匹配织体键值
+            m = re.match('[a-zA-Z\d@-]', key)
+            if m is None:
+                return (0, "不符合规则的标识定义")
+            
+            # 跳过空白
+            while text[offset].isspace():
+                offset += 1
+                if offset >= len(text):
+                    return (offset, '织体定义格式不正确，缺少等号 “=”')
+            
+            # 匹配等号
+            if text[offset] != '=':
+                return (offset, '织体定义格式不正确，缺少等号 “=”')
+            offset += 1
+            
+            # 匹配织体
+            value = text[offset:]
+            m = re.match('[\w\s().`_![\]*^-]*', value)
+            if m.end() != len(value):
+                return (offset+m.end(), '未知字符 “%s”' % value[m.end()])
+            value = value.replace('b', '?')
+            
+            if key == '@':
+                self.current_texture[0] = value
+            if key.isalnum():
+                self.current_texture[1][key] = value
+            return None
+        
+        # 减号开头为另起一小节
+        if text[0] == '-':
+            self.line_start_index = len(self.bar_lists)
+            self.beat_settable = True
+            return None
+        
+        # 冒号开头表示和弦织体伴奏
+        if text[0] == ':':
+            self.beat_settable = False
+            bar_texts = text[1:].split('|')
+            offset = 1
+            line_bar_index = 0  # 相对于当前行的小节号
+            for bar_text_s in bar_texts:
+                # 跳过空小节
+                if len(bar_text_s.strip()) == 0:
+                    offset += len(bar_text_s) + 1
+                    continue
+                
+                # 解析该小节
+                bar = self.parse_chrods_bar(bar_text_s)
+                
+                # 错误处理
+                if type(bar) == tuple:
+                    return (offset + bar[0], bar[1])
+                
+                # 将该小节添加到 bar 列表中
+                if is_valid:
+                    index = self.line_start_index + line_bar_index
+                    if index == len(self.bar_lists):
+                        self.bar_lists.append([bar])
+                    elif index < len(self.bar_lists):
+                        self.bar_lists[index].append(bar)
+                    else:
+                        assert False
+                    
+                    line_bar_index += 1
+                    offset += len(bar_text_s) + 1
+            return None
+        
+        # 寻找是否有等号
+        v = text.split('=')
+        if len(v) > 1:
+            if len(v) == 2:
+                key = v[0].strip()
+                key_offset = len(v[0]) - len(v[0].lstrip())
+                value = v[1].strip()
+                value_offset = len(v[0]) + 1 + len(v[1]) - len(v[1].lstrip())
+                if key == 'bpm':
+                    try:
+                        bpm = int(value)
+                    except ValueError:
+                        return (value_offset, 'bpm值必须为整数。')
+                    if bpm < 1:
+                        return (value_offset, 'bpm必须大于零。')
+                    self.bpm = bpm
+                elif key == 'beat':
+                    if not self.beat_settable:
+                        return (key_offset, '此处不允许设置节拍，请在 - 分割行后面紧跟着设置节拍。')
+                    b = value.split('/')
+                    if len(b) == 1:
+                        return (value_offset, 'beat格式应该为 x/x 例如 4/4')
+                    if len(b) > 2:
+                        return (value_offset + len(b[0]) + len(b[1]) + 1,
+                            'beat格式应该为 x/x 例如 4/4')
+                    b0 = b[0].strip()
+                    b0_offset = len(b[0]) - len(b[0].lstrip())
+                    b1 = b[1].strip()
+                    b1_offset = len(b[1]) - len(b[1].lstrip())
+                    try:
+                        x = int(b0)
+                    except ValueError:
+                        return (b0_offset, 'beat两个值必须为整数。')
+                    if x < 1:
+                        return (b0_offset, 'beat两个值必须大于零。')
+                    try:
+                        y = int(b1)
+                    except ValueError:
+                        return (b1_offset, 'beat两个值必须为整数。')
+                    if y < 1:
+                        return (b1_offset, 'beat两个值必须大于零。')
+                    beat = (x,y)
+                    if not meter.is_valid(beat):
+                        return (b0_offset, 'beat值不符合乐理规则。')
+                    self.beat = beat
+                elif key == '1':
+                    if not notes.is_valid_note(value):
+                        return (value_offset, '调性不正确，请设置为一个音，例如 G#。')
+                    self.tonality = value
+                elif key == 'C':
+                    if not notes.is_valid_note(value):
+                        return (value_offset, '调性不正确，请设置为一个音，例如 G#。')
+                    self.chord_transposition = value
+                else:
+                    return (key_offset, '未知的键值。')
+            elif len(v) > 2:
+                return (len(v[0])+len(v[1]), '格式不正确。')
+            return None
+
+        # 判断是否为织体定义
+        if text.startswith('texture'):
+            offset = 7  # len('texture')
+            
+            # 跳过空白
+            while text[offset].isspace():
+                offset += 1
+                if offset >= len(text):
+                    return (offset, '织体定义格式不正确，缺少冒号 “:”')
+            
+            # 匹配冒号
+            if text[offset] != ':':
+                return (offset, '织体定义格式不正确，缺少冒号 “:”')
+            offset += 1
+            
+            # 跳过空白
+            while text[offset].isspace():
+                offset += 1
+                if offset >= len(text):
+                    return (offset, '织体格式不正确，缺少织体名称')
+            
+            # 匹配织体名称
+            m = re.match('[A-Za-z]\w*', text[offset:])
+            if m is None:
+                return (offset, '织体格式不正确，缺少织体名称')
+            texture_name = m.group()
+            offset += m.end()
+            
+            # 跳过空白
+            while text[offset].isspace():
+                offset += 1
+                if offset >= len(text):
+                    return (offset, '织体定义格式不正确，缺少大括号 “{”')
+            
+            # 匹配大括号
+            if text[offset] != '{':
+                return (offset, '织体定义格式不正确，缺少大括号 “{”')
+            offset += 1
+            
+            # 空白收尾
+            while offset < len(text):
+                if not text[offset].isspace():
+                    return (offset, '织体定义格式不正确，多余的字符 “%s”' % text[offset])
+                offset += 1
+
+            # 执行到这里说明格式均正确，将该织体记录下来
+            self.current_texture_name = texture_name
+            self.current_texture = ['', dict()] # 这是默认参数
+            return None
+
+        # 其他（识别为正常旋律）e
+
+        # 划分小节
+        self.beat_settable = False
+        bar_texts = text.split('|')
+        offset = 0
+        line_bar_index = 0  # 相对于当前行的小节号
+        for bar_text_s in bar_texts:
+            # 跳过空小节
+            if len(bar_text_s.strip()) == 0:
+                offset += len(bar_text_s) + 1
+                continue
+            
+            # 解析该小节
+            bar = self.parse_bar(bar_text_s)
+            
+            # 错误处理
+            if type(bar) == tuple:
+                return (offset + bar[0], bar[1])
+            
+            # 将该小节添加到 bar 列表中
+            if is_valid:
+                index = self.line_start_index + line_bar_index
+                if index == len(self.bar_lists):
+                    self.bar_lists.append([bar])
+                elif index < len(self.bar_lists):
+                    self.bar_lists[index].append(bar)
+                else:
+                    assert False
+            
+            line_bar_index += 1
+            offset += len(bar_text_s) + 1
+
+
+    def parse_lines(self, text, valid_start_line = 0):
+        """
+            解析文本内容
+            text:
+                要解析的文本
+            valid_start_line:
+                从第几行开始，在此行号之前的音节全部忽略
+            返回值：
+                None 表示解析成功，否则返回四元组 (行数,列数,该行字符串,提示字符串)
+        """
+        
+        line_texts = text.split('\n')
+        i = 0
+        while i < len(line_texts):
+            line_text = line_texts[i]
+            err = self.parse_line(line_text.strip(), valid_start_line <= i)
+            if err is not None:
+                offset = len(line_text) - len(line_text.lstrip())
+                return (i, offset+err[0], line_text, err[1])
+            i += 1
+        return None
+
+    def generateComposition(self, valid_start_bar_index = 0):
+        """
+            生成曲子 （返回值 Composition 格式）
+            valid_start_line:
+                从第几个小节开始，在此小节号之前的音节全部忽略
+        """
+        if valid_start_bar_index > len(self.bar_lists):
+            valid_start_bar_index = len(self.bar_lists)
+        self.bar_lists = self.bar_lists[valid_start_bar_index:]
+
+        # 先求出所需音轨的个数
+        num_track = 0
+        for bars in self.bar_lists:
+            if len(bars) > num_track:
+                num_track = len(bars)
+        
+        # 创建出这几个音轨
+        tracks = []
+        for i in range(num_track):
+            tracks.append(Track())
+        
+        # 给每个音轨添加 Bar
+        for bars in self.bar_lists:
+            # 将已存在的 Bar 添加进去
+            i = 0
+            for bar in bars:
+                tracks[i].add_bar(bar)
+                i += 1
+            
+            # 升成全休止的 bar 填充
+            rest_bar = Bar(self.tonality, bars[0].meter)
+            rest_bar.place_rest(Fraction(rest_bar.meter[1],rest_bar.meter[0]))
+            
+            # 填充全休止
+            while i < num_track:
+                tracks[i].add_bar(rest_bar)
+                i += 1
+
+        # 创建歌曲
+        composition = Composition()
+        for track in tracks:
+            composition.add_track(track)
+        
+        return composition
+
+def main(args):
+    # 检查输入文件的存在性
+    if not os.path.isfile(args.file):
+        sys.stderr.write('文件 %d 不存在。\n', args.file)
+        return 1
+    
+    # 读取到文件的内容
+    text = open(args.file, 'r', encoding = 'utf-8').read()
+    
+    # 解析文件内容
+    parser = numberedMusicalNotationParser()
+    err = parser.parse_lines(text, args.line-1)
+    if err is not None:
+        # 颜色字符串函数
+        def color_text(info_str, color_str):
+            return '\033[' + color_str + 'm' + info_str + '\033[0m'
+        
+        sys.stderr.write('第 %d 行第 %d 列：\n' % (err[0]+1, err[1]+1))
+        sys.stderr.write('%s\n' % err[2])
+        sys.stderr.write('' + ' '*err[1] + '^\n')
+        sys.stderr.write('%s： %s\n' % (color_text('解析错误', '31'), err[3]))
+        return 1
+    
+    # 生成歌曲
+    if args.line != 1:
+        args.bar = 1
+    composition = parser.generateComposition(args.bar-1)
+    
+    #print(parser.bpm, parser.beat, parser.tonality)
+    #print(composition)
+    #print(parser.texture)
+    
+    if args.dest:
+        from mingus.midi import midi_file_out
+        midi_file_out.write_Composition(args.dest, composition, bpm = parser.bpm)
+        return 0
+    
+    if args.sf2:
+        from mingus.midi import fluidsynth
+        if not fluidsynth.init(args.sf2):
+            sys.stderr.write('初始化音频失败。')
+            return 2
+        fluidsynth.play_Composition(composition, bpm = parser.bpm)
+    return 0
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description = \
+        "Numbered music composition software. " + \
+        "Input the numbered musical notation file in text format, " + \
+        "output to audio device or midi file.")
+    parser.add_argument('file', help = \
+        'Input the path of the text file.')
+    parser.add_argument('dest', help = \
+        'Output the path of the midi file. ' + \
+        'If this parameter is specified, the song will not be played.',
+        nargs='?')
+    parser.add_argument('--bar', '-b', help = \
+        'The number of the bar of the starting position of the playback.' + \
+        'If --line is specified, this parameter will be invalid.' + \
+        'The default is 1', default = 1, type = int)
+    parser.add_argument('--line', '-l', help = \
+        'The line number of the playback.' + \
+        'The default is 1', default = 1, type = int)
+    parser.add_argument('--sf2', '-s', help = \
+        'A soundfont v2.0 file for playback.' + \
+        'If this parameter is not specified, ' + \
+        'no music will be played, ' + \
+        'just check the format of the score.')
+    args = parser.parse_args()
+    
+    exit(main(args))
+
+
